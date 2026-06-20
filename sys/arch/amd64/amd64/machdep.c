@@ -584,11 +584,27 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		} else
 			strlcpy(vmmode, "host", sizeof(vmmode));
 		return sysctl_rdstring(oldp, oldlenp, newp, vmmode);
+#ifndef SMALL_KERNEL
+	case CPU_HWP:
+		return (pstate_hwp_sysctl(name + 1, namelen - 1, oldp, oldlenp,
+		    newp, newlen, p));
+#endif
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
 	}
 	/* NOTREACHED */
+}
+
+int
+cpu_hwp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+    void *newp, size_t newlen, struct proc *p)
+{
+#ifndef SMALL_KERNEL
+	return (pstate_hwp_sysctl(name, namelen, oldp, oldlenp, newp, newlen, p));
+#else
+	return (EOPNOTSUPP);
+#endif
 }
 
 static inline void

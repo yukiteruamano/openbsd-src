@@ -344,6 +344,7 @@ est_init(struct cpu_info *ci)
 	if (setperf_prio > 3)
 		return;
 
+	printf("%s:%d\n", __func__, __LINE__);
 #if NACPICPU > 0
 	est_fqlist = est_acpi_init();
 #endif
@@ -386,7 +387,7 @@ est_init(struct cpu_info *ci)
 			 * disable EST: - A lowest clock ratio of 0, which
 			 * seems to happen on all Pentium 4's that report EST.
 			 * - An equal highest and lowest clock ratio, which
-			 * happens on at least the Core 2 Duo X6800, maybe on 
+			 * happens on at least the Core 2 Duo X6800, maybe on
 			 * newer models too.
 			 */
 			return;

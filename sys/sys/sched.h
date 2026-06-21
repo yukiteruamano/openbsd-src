@@ -186,7 +186,13 @@ int sysctl_hwncpuonline(void);
 #define CPUTYP_P	0x02	/* Performance core */
 #define CPUTYP_E	0x04	/* Efficiency core */
 #define CPUTYP_L	0x08	/* Lethargic, Low Power Efficiency core */
-extern int sched_blockcpu;
+
+/* --------------------------------------------------------------
+ * SMT‑Awareness helpers (kernel‑internal)
+ * -------------------------------------------------------------- */
+#define SMT_BLOCK_PENALTY   8  /* Extra cost when SMT is disabled and the target CPU is a sibling */
+
+extern volatile int sched_blockcpu;
 
 #ifdef MULTIPROCESSOR
 void sched_start_secondary_cpus(void);

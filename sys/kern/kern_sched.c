@@ -19,6 +19,7 @@
 
 #include <sys/sched.h>
 #include <sys/proc.h>
+#include <sys/ucred.h>
 #include <sys/kthread.h>
 #include <sys/systm.h>
 #include <sys/clockintr.h>
@@ -29,6 +30,19 @@
 #include <sys/tracepoint.h>
 
 #include <uvm/uvm_extern.h>
+
+/* ---------------------------------------------------------------------
+ *  Helper: check whether two cpu_info structures belong to the same
+ *  physical core (same package and core id).  Defined here (kernel file)
+ *  because struct cpu_info is only fully defined after including the
+ *  machine‑specific headers, which are not available in <sys/sched.h>.
+ * --------------------------------------------------------------------- */
+static inline int
+cpu_is_smt_sibling(const struct cpu_info *a, const struct cpu_info *b)
+{
+    return (a->ci_pkg_id == b->ci_pkg_id &&
+            a->ci_core_id == b->ci_core_id);
+}
 
 void sched_kthreads_create(void *);
 
@@ -55,7 +69,7 @@ uint64_t sched_choose;		/* Times we chose a cpu */
 uint64_t sched_wasidle;		/* Times we came out of idle */
 
 #ifdef __HAVE_CPU_TOPOLOGY
-int sched_blockcpu;		/* Types of cpu to not schedule on */
+volatile int sched_blockcpu;	/* Types of cpu to not schedule on */
 #endif
 
 /*
@@ -380,6 +394,10 @@ sched_choosecpu_fork(struct proc *parent, int flags)
 	int run, best_run = INT_MAX;
 	struct cpu_info *ci;
 	struct cpuset set;
+#ifdef __HAVE_CPU_TOPOLOGY
+	CPU_INFO_ITERATOR cii2;
+	struct cpu_info *other;
+#endif
 
 #if 0
 	/*
@@ -411,6 +429,29 @@ sched_choosecpu_fork(struct proc *parent, int flags)
 		cpuset_del(&set, ci);
 
 		run = ci->ci_schedstate.spc_nrun;
+
+#ifdef __HAVE_CPU_TOPOLOGY
+		/*
+		 * SMT Awareness Hardening: The topology logic only has an
+		 * effect if the administrator has explicitly allowed the
+		 * use of SMT (hw.smt=1).
+		 */
+		if ((sched_blockcpu & CPUTYP_SMT) == 0) {
+			/* Penalize allocation directly on a secondary thread */
+			if (ci->ci_smt_id > 0)
+				run += 1;
+
+			/* Scan if the sibling physical core is currently busy */
+			CPU_INFO_FOREACH(cii2, other) {
+				if (other->ci_pkg_id == ci->ci_pkg_id &&
+				    other->ci_core_id == ci->ci_core_id &&
+				    other != ci && !cpu_is_idle(other)) {
+					run += 1;
+					break;
+				}
+			}
+		}
+#endif
 
 		if (choice == NULL || run < best_run) {
 			choice = ci;
@@ -491,15 +532,51 @@ sched_choosecpu(struct proc *p)
 /*
  * Attempt to steal a proc from some cpu.
  */
+
+/* Helper to pick the best candidate to steal from a given CPU's runqueue */
+static struct proc *
+steal_best_candidate(struct schedstate_percpu *spc, struct cpu_info *self)
+{
+    struct proc *p, *best = NULL;
+    int queue = ffs(spc->spc_whichqs) - 1;
+
+    TAILQ_FOREACH_REVERSE(p, &spc->spc_qs[queue], prochead, p_runq) {
+        /* Skip hardware‑pinned processes */
+        if (p->p_flag & P_CPUPEG)
+            continue;
+        /* Do not steal kernel processes for a user‑land thief */
+        if ((p->p_flag & P_SYSTEM) && curproc && !(curproc->p_flag & P_SYSTEM))
+            continue;
+        /* UID isolation */
+        if (curproc && p->p_ucred->cr_uid != curproc->p_ucred->cr_uid)
+            continue;
+        /* When SMT is disabled, avoid siblings */
+        if ((sched_blockcpu & CPUTYP_SMT) &&
+            cpu_is_smt_sibling(p->p_cpu, self))
+            continue;
+
+        /* Prefer higher priority; break ties by running state */
+        if (best == NULL ||
+            p->p_usrpri > best->p_usrpri ||
+            (p->p_usrpri == best->p_usrpri && p->p_slptime == 0)) {
+            best = p;
+        }
+    }
+    return best;
+}
+
 struct proc *
 sched_steal_proc(struct cpu_info *self)
 {
-	struct proc *best = NULL;
 #ifdef MULTIPROCESSOR
-	struct schedstate_percpu *spc;
-	int bestcost = INT_MAX;
+	/* struct schedstate_percpu *spc; // unused placeholder */
 	struct cpu_info *ci;
 	struct cpuset set;
+	struct proc *p;
+
+	/* Security rule 1: Fast‑path return if SMT is blocked */
+	if (sched_blockcpu & CPUTYP_SMT)
+		return (NULL);
 
 	KASSERT((self->ci_schedstate.spc_schedflags & SPCF_SHOULDHALT) == 0);
 
@@ -510,39 +587,23 @@ sched_steal_proc(struct cpu_info *self)
 	cpuset_copy(&set, &sched_queued_cpus);
 
 	while ((ci = cpuset_first(&set)) != NULL) {
-		struct proc *p;
-		int queue;
-		int cost;
+		struct schedstate_percpu *spc = &ci->ci_schedstate;
 
-		cpuset_del(&set, ci);
-
-		spc = &ci->ci_schedstate;
-
-		queue = ffs(spc->spc_whichqs) - 1;
-		TAILQ_FOREACH(p, &spc->spc_qs[queue], p_runq) {
-			if (p->p_flag & P_CPUPEG)
-				continue;
-
-			cost = sched_proc_to_cpu_cost(self, p);
-
-			if (best == NULL || cost < bestcost) {
-				best = p;
-				bestcost = cost;
+		if (spc->spc_nrun > 1) {
+			p = steal_best_candidate(spc, self);
+			if (p != NULL) {
+				TRACEPOINT(sched, steal, p->p_tid + THREAD_PID_OFFSET,
+				    p->p_p->ps_pid, CPU_INFO_UNIT(self));
+				remrunqueue(p);
+				p->p_cpu = self;
+				sched_stolen++;
+				return p;
 			}
 		}
+		cpuset_del(&set, ci);
 	}
-	if (best == NULL)
-		return (NULL);
-
-	TRACEPOINT(sched, steal, best->p_tid + THREAD_PID_OFFSET,
-	    best->p_p->ps_pid, CPU_INFO_UNIT(self));
-
-	remrunqueue(best);
-	best->p_cpu = self;
-
-	sched_stolen++;
 #endif
-	return (best);
+	return (NULL);
 }
 
 #ifdef MULTIPROCESSOR
@@ -574,6 +635,7 @@ log2(unsigned int i)
 int sched_cost_priority = 1;
 int sched_cost_runnable = 3;
 int sched_cost_resident = 1;
+int sched_cost_smt = 2;
 #endif
 
 int
@@ -581,6 +643,8 @@ sched_proc_to_cpu_cost(struct cpu_info *ci, struct proc *p)
 {
 	int cost = 0;
 #ifdef MULTIPROCESSOR
+	CPU_INFO_ITERATOR cii;
+	struct cpu_info *other;
 	struct schedstate_percpu *spc;
 	int l2resident = 0;
 
@@ -598,6 +662,32 @@ sched_proc_to_cpu_cost(struct cpu_info *ci, struct proc *p)
 	}
 	if (cpuset_isset(&sched_queued_cpus, ci))
 		cost += spc->spc_nrun * sched_cost_runnable;
+
+#ifdef __HAVE_CPU_TOPOLOGY
+    /*
+     * SMT Awareness Hardening:
+     *   - If SMT is disabled (sched_blockcpu & CPUTYP_SMT),
+     *     penalize moving to a sibling of the current CPU.
+     */
+    if (sched_blockcpu & CPUTYP_SMT) {
+        /* SMT disabled → huge penalty for sibling CPUs */
+        if (cpu_is_smt_sibling(ci, curcpu()))
+            cost += SMT_BLOCK_PENALTY;
+    } else {
+        /* SMT enabled – keep original heuristic */
+        if (ci->ci_smt_id > 0)
+            cost += 1;
+
+        CPU_INFO_FOREACH(cii, other) {
+            if (other->ci_pkg_id == ci->ci_pkg_id &&
+                other->ci_core_id == ci->ci_core_id &&
+                other != ci && !cpu_is_idle(other)) {
+                cost += sched_cost_smt;
+                break;
+            }
+        }
+    }
+#endif
 
 	/*
 	 * Try to avoid the primary cpu as it handles hardware interrupts.
@@ -862,8 +952,10 @@ sched_cpuadjust(int newblockcpu)
 			continue;
 		inset = cpuset_isset(&sched_all_cpus, ci);
 		if (ci->ci_cputype & sched_blockcpu) {
-			if (inset)
+			if (inset) {
 				cpuset_del(&sched_all_cpus, ci);
+				need_resched(ci);
+			}
 		} else {
 			if (!inset)
 				cpuset_add(&sched_all_cpus, ci);
